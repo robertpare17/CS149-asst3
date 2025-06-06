@@ -27,6 +27,34 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+// CUDA kernel for upsweep phase of exclusive scan
+__global__ void upsweep_kernel(int* data, int N, int two_d) {
+    int two_dplus1 = two_d * 2;
+    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Map thread_id to actual array index that needs processing
+    int i = thread_id * two_dplus1;
+
+    if (i < N) {
+        data[i + two_dplus1 - 1] += data[i + two_d - 1];
+    }
+}
+
+// CUDA kernel for downsweep phase of exclusive scan
+__global__ void downsweep_kernel(int* data, int N, int two_d) {
+    int two_dplus1 = two_d * 2;
+    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Map thread_id to actual array index that needs processing
+    int i = thread_id * two_dplus1;
+
+    if (i < N) {
+        int temp = data[i + two_d - 1];
+        data[i + two_d - 1] = data[i + two_dplus1 - 1];
+        data[i + two_dplus1 - 1] += temp;
+    }
+}
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -54,7 +82,46 @@ void exclusive_scan(int* input, int N, int* result)
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
 
+    int rounded_N = nextPow2(N);
 
+    cudaMemcpy(result, input, N * sizeof(int), cudaMemcpyDeviceToDevice);
+
+    // Upsweep phase
+    for (int two_d = 1; two_d <= rounded_N/2; two_d *= 2) {
+        int two_dplus1 = two_d * 2;
+
+        // Calculate number of threads needed for this iteration
+        int num_active_threads = rounded_N / two_dplus1;
+
+        if (num_active_threads > 0) {
+            int threads_per_block = min(THREADS_PER_BLOCK, num_active_threads);
+            int num_blocks = (num_active_threads + threads_per_block - 1) / threads_per_block;
+
+            upsweep_kernel<<<num_blocks, threads_per_block>>>(result, rounded_N, two_d);
+            cudaDeviceSynchronize();
+        }
+    }
+
+    // Set the last element to zero for exclusive scan
+    int zero = 0;
+    cudaMemcpy(&result[rounded_N - 1], &zero, sizeof(int), cudaMemcpyHostToDevice);
+
+    // Downsweep phase
+    for (int two_d = rounded_N/2; two_d >= 1; two_d /= 2) {
+        int two_dplus1 = 2 * two_d;
+        
+        // Calculate number of threads actually needed for this iteration
+        int num_active_threads = rounded_N / two_dplus1;
+
+        if (num_active_threads > 0) {
+            // Launch only the threads we need
+            int threads_per_block = min(num_active_threads, 512);
+            int num_blocks = (num_active_threads + threads_per_block - 1) / threads_per_block;
+            
+            downsweep_kernel<<<num_blocks, threads_per_block>>>(result, rounded_N, two_d);
+            cudaDeviceSynchronize();
+        }
+    }   
 }
 
 
@@ -140,6 +207,26 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration; 
 }
 
+// CUDA kernel to creat flags array marking where A[i] == A[i+1]
+__global__ void create_flags_kernel(int* input, int* flags, int length) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < length - 1) {
+        flags[i] = (input[i] == input[i + 1]) ? 1 : 0;
+    } else if (i == length - 1) {
+        flags[i] = 0; // last element has no next element to compare
+    }
+}
+
+// CUDA kernel to compact results using exclusive scan output
+__global__ void compact_results_kernel(int* flags, int* scan_result, int* output, int length) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < length - 1 && flags[i] == 1) {
+        output[scan_result[i]] = i; // store index of repeat
+    }
+}
+
 
 // find_repeats --
 //
@@ -161,7 +248,41 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
 
-    return 0; 
+    int rounded_length = nextPow2(length);
+
+    int* device_flags;
+    int* device_scan_result;
+
+    cudaMalloc(&device_flags, rounded_length * sizeof(int));
+    cudaMalloc(&device_scan_result, rounded_length * sizeof(int));
+
+    // Initialize arrays to 0 
+    cudaMemset(device_flags, 0, rounded_length * sizeof(int));
+    cudaMemset(device_scan_result, 0, rounded_length * sizeof(int));
+
+    // Step 1: Create flags array
+    int num_blocks = (length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    create_flags_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(device_input, device_flags, length);
+    cudaDeviceSynchronize();
+
+    // Step 2: Perform exclusive scan on flags array
+    exclusive_scan(device_flags, length, device_scan_result);
+
+    // Step 3: Compact results into output array
+    compact_results_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(device_flags, device_scan_result, device_output, length);
+    cudaDeviceSynchronize();
+
+    // Step 4: Get the total count 
+    int last_scan_value, last_flag_value;
+    cudaMemcpy(&last_scan_value, &device_scan_result[length - 1], sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&last_flag_value, &device_flags[length - 1], sizeof(int), cudaMemcpyDeviceToHost);
+
+    int total_repeats = last_scan_value + last_flag_value;
+
+    cudaFree(device_flags);
+    cudaFree(device_scan_result);
+
+    return total_repeats; // return the number of pairs found
 }
 
 
