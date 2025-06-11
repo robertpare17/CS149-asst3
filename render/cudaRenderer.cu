@@ -774,6 +774,154 @@ __global__ void kernelRenderTiles(TileCircleMapping* tileMapping) {
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
+// CUDA Array Debugging Methods
+
+// ============================================================================
+// METHOD 1: Device-side printing (within kernels)
+// ============================================================================
+
+__global__ void debugKernel(int* deviceArray, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Print from specific threads only to avoid overwhelming output
+    if (idx == 0) {
+        printf("=== Device Array Debug ===\n");
+        for (int i = 0; i < min(size, 20); i++) { // Limit to first 20 elements
+            printf("deviceArray[%d] = %d\n", i, deviceArray[i]);
+        }
+    }
+}
+
+// Call this after your kernel to debug device arrays
+void debugDeviceArray(int* devicePtr, int size, const char* arrayName) {
+    printf("\n--- Debugging %s ---\n", arrayName);
+    debugKernel<<<1, 1>>>(devicePtr, size);
+    cudaDeviceSynchronize();
+    printf("--- End %s ---\n\n", arrayName);
+}
+
+// ============================================================================
+// METHOD 2: Copy to host and print (most reliable)
+// ============================================================================
+
+void printDeviceArrayOnHost(int* devicePtr, int size, const char* arrayName) {
+    // Allocate host memory
+    int* hostArray = new int[size];
+    
+    // Copy device data to host
+    cudaMemcpy(hostArray, devicePtr, size * sizeof(int), cudaMemcpyDeviceToHost);
+    
+    printf("\n=== %s (copied from device) ===\n", arrayName);
+    for (int i = 0; i < min(size, 50) ; i++) { // Limit output
+        // if (hostArray[i] == 0) continue; // Skip zero values for clarity
+        printf("%s[%d] = %d\n", arrayName, i, hostArray[i]);
+        if (i > 0 && i % 10 == 0) printf("\n"); // Add spacing every 10 elements
+    }
+    if (size > 50) {
+        printf("... (showing first 50 of %d elements)\n", size);
+    }
+    printf("=== End %s ===\n\n", arrayName);
+    
+    delete[] hostArray;
+}
+
+// For float arrays
+void printDeviceFloatArrayOnHost(float* devicePtr, int size, const char* arrayName) {
+    float* hostArray = new float[size];
+    cudaMemcpy(hostArray, devicePtr, size * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    printf("\n=== %s (float array) ===\n", arrayName);
+    for (int i = 0; i < min(size, 30); i++) {
+        printf("%s[%d] = %.4f\n", arrayName, i, hostArray[i]);
+    }
+    if (size > 30) printf("... (showing first 30 of %d elements)\n", size);
+    printf("=== End %s ===\n\n", arrayName);
+    
+    delete[] hostArray;
+}
+
+// ============================================================================
+// METHOD 3: Host array printing (simple)
+// ============================================================================
+
+void printHostArray(int* hostPtr, int size, const char* arrayName) {
+    printf("\n=== %s (host array) ===\n", arrayName);
+    for (int i = 0; i < min(size, 50); i++) {
+        printf("%s[%d] = %d ", arrayName, i, hostPtr[i]);
+        if ((i + 1) % 10 == 0) printf("\n"); // New line every 10 elements
+    }
+    if (size > 50) printf("\n... (showing first 50 of %d elements)", size);
+    printf("\n=== End %s ===\n\n", arrayName);
+}
+
+// ============================================================================
+// METHOD 4: Debug your specific tile mapping structures
+// ============================================================================
+
+void debugTileMapping(TileCircleMapping* hostMapping, TileCircleMapping* deviceMapping) {
+    printf("\n========== TILE MAPPING DEBUG ==========\n");
+    
+    // Print basic info
+    printf("Tiles per row: %d\n", hostMapping->tilesPerRow);
+    printf("Tiles per col: %d\n", hostMapping->tilesPerCol);
+    printf("Total tiles: %d\n", hostMapping->numTiles);
+    
+    // Debug tile circle counts
+    printDeviceArrayOnHost(hostMapping->tileCircleCounts, hostMapping->numTiles, "TileCircleCounts");
+    
+    // Debug tile offsets
+    printDeviceArrayOnHost(hostMapping->tileOffsets, hostMapping->numTiles, "TileOffsets");
+    
+    // Debug first few circle indices (limited because this can be very large)
+    int totalCircleRefs = 0;
+    int* tempCounts = new int[hostMapping->numTiles];
+    cudaMemcpy(tempCounts, hostMapping->tileCircleCounts, 
+               hostMapping->numTiles * sizeof(int), cudaMemcpyDeviceToHost);
+    
+    for (int i = 0; i < hostMapping->numTiles; i++) {
+        totalCircleRefs += tempCounts[i];
+    }
+    printf("Total circle references: %d\n", totalCircleRefs);
+    
+    // Show circle indices for first few tiles that have circles
+    int* tempOffsets = new int[hostMapping->numTiles];
+    cudaMemcpy(tempOffsets, hostMapping->tileOffsets, 
+               hostMapping->numTiles * sizeof(int), cudaMemcpyDeviceToHost);
+    
+    printf("\n--- Circle indices for first 5 non-empty tiles ---\n");
+    int tilesShown = 0;
+    for (int tileId = 0; tileId < hostMapping->numTiles && tilesShown < 5; tileId++) {
+        if (tempCounts[tileId] > 0) {
+            printf("Tile %d has %d circles starting at offset %d:\n", 
+                   tileId, tempCounts[tileId], tempOffsets[tileId]);
+            
+            // Copy and print circle indices for this tile
+            int* circleIndices = new int[tempCounts[tileId]];
+            cudaMemcpy(circleIndices, 
+                      &hostMapping->circleIndices[tempOffsets[tileId]], 
+                      tempCounts[tileId] * sizeof(int), 
+                      cudaMemcpyDeviceToHost);
+            
+            for (int i = 0; i < min(tempCounts[tileId], 10); i++) {
+                printf("  Circle[%d] = %d\n", i, circleIndices[i]);
+            }
+            if (tempCounts[tileId] > 10) {
+                printf("  ... (%d more circles)\n", tempCounts[tileId] - 10);
+            }
+            printf("\n");
+            
+            delete[] circleIndices;
+            tilesShown++;
+        }
+    }
+    
+    delete[] tempCounts;
+    delete[] tempOffsets;
+    printf("========== END TILE MAPPING DEBUG ==========\n\n");
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 
 CudaRenderer::CudaRenderer() {
     image = NULL;
@@ -1040,15 +1188,24 @@ void CudaRenderer::render() {
     kernelCountCirclesPerTile<<<blocksPerGrid, threadsPerBlock>>>(deviceTileMapping);
     cudaDeviceSynchronize();
 
+    printf("=== AFTER PHASE 1: Circle Counting ===\n");
+    printDeviceArrayOnHost(hostTileMapping.tileCircleCounts, hostTileMapping.numTiles, "TileCircleCounts");
+
     // Phase 2: Compute tile offsets using exclusive scan
     thrust::device_ptr<int> dev_counts(hostTileMapping.tileCircleCounts);
     thrust::device_ptr<int> dev_offsets(hostTileMapping.tileOffsets);
     thrust::exclusive_scan(dev_counts, dev_counts + hostTileMapping.numTiles, dev_offsets);
 
+    printf("=== AFTER PHASE 2: Offset Computation ===\n");
+    printDeviceArrayOnHost(hostTileMapping.tileOffsets, hostTileMapping.numTiles, "TileOffsets");
+
     // Phase 3: Clear temp counters and build the tile mapping
     cudaCheckError(cudaMemset(hostTileMapping.tempWriteCounters, 0, sizeof(int) * hostTileMapping.numTiles));
     kernelBuildTileMapping<<<blocksPerGrid, threadsPerBlock>>>(deviceTileMapping);
     cudaDeviceSynchronize();
+
+    printf("=== AFTER PHASE 3: Tile Mapping Built ===\n");
+    debugTileMapping(&hostTileMapping, deviceTileMapping);
 
     // Phase 4: Render tiles
     dim3 tileBlockDim(TILE_SIZE, TILE_SIZE);
