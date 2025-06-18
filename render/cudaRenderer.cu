@@ -56,6 +56,7 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 // Additional constants used for tile-based rendering implementation
 #define TILE_SIZE 16
 #define MAX_CIRCLES_PER_TILE 64
+#define SCAN_BLOCK_DIM 256  // Must match your block size and be power of 2
 
 // // Data structure for tile-circle mapping
 // struct TileCircleMapping {
@@ -68,7 +69,7 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 //     int tilesPerCol;
 // };
 
-#define DEBUG
+// #define DEBUG
 
 #ifdef DEBUG
 #define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
@@ -91,6 +92,7 @@ inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
 #include "circleBoxTest.cu_inl"
+#include "exclusiveScan.cu_inl"
 
 
 // kernelClearImageSnowflake -- (CUDA device code)
@@ -671,6 +673,92 @@ __global__ void kernelBuildTileMapping(TileCircleMapping* tileMapping) {
     }
 }
 
+// Phase 2: Build the tile-circle mapping (prefix sum approach)
+__global__ void kernelBuildOrderedTileMappingWithPrefixSum(TileCircleMapping* tileMapping) {
+    // Each block handles one tile
+    int tileId = blockIdx.x;
+
+    if (tileId >= tileMapping->numTiles)
+        return;
+
+    // Calculate this tile's bounds
+    int tileX = tileId % tileMapping->tilesPerRow;
+    int tileY = tileId / tileMapping->tilesPerRow;
+
+    // float invTileSize = 1.0f / TILE_SIZE;
+    float imageWidth = (float)cuConstRendererParams.imageWidth;
+    float imageHeight = (float)cuConstRendererParams.imageHeight;
+
+    float tileL = float(tileX) * TILE_SIZE / imageWidth;
+    float tileR = float(tileX + 1) * TILE_SIZE / imageWidth;
+    float tileB = float(tileY) * TILE_SIZE / imageHeight;
+    float tileT = float(tileY + 1) * TILE_SIZE / imageHeight;
+
+    // Shared memory for intersection flags and prefix sum
+    // Shared memory arrays - NOTE: Must be uint, not int!
+    __shared__ uint intersectionFlags[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSum[SCAN_BLOCK_DIM];
+    __shared__ volatile uint scratchArray[2 * SCAN_BLOCK_DIM];  // Required by scan
+    __shared__ int sharedWritePos;  // For broadcasting writePos
+    // extern __shared__ int sharedData[];
+    // int* intersectionFlags = sharedData; // First part of shared memory
+    // int* prefixSum = &sharedData[blockDim.x]; // Second part for prefix sum
+
+    int threadId = threadIdx.x;
+    int numThreads = blockDim.x;
+
+    int writePos = tileMapping->tileOffsets[tileId];
+
+    // Process circles in chunks of blockDim.x
+    for (int chunkStart = 0; chunkStart < cuConstRendererParams.numCircles; chunkStart += numThreads) {
+        int circleIdx = chunkStart + threadId;
+
+        // Initialize intersection flag
+        intersectionFlags[threadId] = 0;
+
+        if (circleIdx < cuConstRendererParams.numCircles) {
+            // Read circle position and radius
+            int index3 = 3 * circleIdx;
+            float3 pos = *(float3*)(&cuConstRendererParams.position[index3]);
+            float rad = cuConstRendererParams.radius[circleIdx];
+
+            // Test if circle intersects the tile
+            if (circleInBoxConservative(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
+                intersectionFlags[threadId] = 1;
+            }
+        }
+
+        __syncthreads();
+
+        // Compute prefix sum of intersection flags
+        // This tells us the write position for each intersecting circle
+        // sharedMemExclusiveScan(threadId, intersectionFlags, prefixSum, numThreads);
+
+        // FIXED: Correct function signature with all 5 parameters
+        sharedMemExclusiveScan(threadId, intersectionFlags, prefixSum, scratchArray, numThreads);
+        __syncthreads();
+
+        // Write intersecting circles to global memory in order
+        if (circleIdx < cuConstRendererParams.numCircles && intersectionFlags[threadId] == 1) {
+            int localWritePos = prefixSum[threadId];
+            tileMapping->circleIndices[writePos + localWritePos] = circleIdx;
+        }
+
+        __syncthreads();
+
+        if (threadId == 0) {
+            // // Count total intersections in this chunk
+            // int totalIntersections = prefixSum[numThreads - 1] + intersectionFlags[numThreads - 1];
+            // writePos += totalIntersections;
+
+            // Count total intersections in this chunk
+            uint totalIntersections = prefixSum[numThreads - 1] + intersectionFlags[numThreads - 1];
+            sharedWritePos += totalIntersections;
+        }
+        __syncthreads();
+    }
+}
+
 // Phase 3: Tile-based rendering kernel
 __global__ void kernelRenderTiles(TileCircleMapping* tileMapping) {
     // Each block processes one tile
@@ -1182,30 +1270,42 @@ void CudaRenderer::render() {
     // Phase 1: Clear counters and count circles per tile
     cudaCheckError(cudaMemset(hostTileMapping.tileCircleCounts, 0, sizeof(int) * hostTileMapping.numTiles));
 
-    int threadsPerBlock = 256;
+    int threadsPerBlock = 256; // Must match SCAN_BLOCK_DIM in prefix sum kernel
     int blocksPerGrid = (numCircles + threadsPerBlock - 1) / threadsPerBlock;
 
     kernelCountCirclesPerTile<<<blocksPerGrid, threadsPerBlock>>>(deviceTileMapping);
     cudaDeviceSynchronize();
-
-    printf("=== AFTER PHASE 1: Circle Counting ===\n");
-    printDeviceArrayOnHost(hostTileMapping.tileCircleCounts, hostTileMapping.numTiles, "TileCircleCounts");
+    
+    #ifdef DEBUG
+        printf("=== AFTER PHASE 1: Circle Counting ===\n");
+        printDeviceArrayOnHost(hostTileMapping.tileCircleCounts, hostTileMapping.numTiles, "TileCircleCounts");
+    #endif
 
     // Phase 2: Compute tile offsets using exclusive scan
     thrust::device_ptr<int> dev_counts(hostTileMapping.tileCircleCounts);
     thrust::device_ptr<int> dev_offsets(hostTileMapping.tileOffsets);
     thrust::exclusive_scan(dev_counts, dev_counts + hostTileMapping.numTiles, dev_offsets);
 
-    printf("=== AFTER PHASE 2: Offset Computation ===\n");
-    printDeviceArrayOnHost(hostTileMapping.tileOffsets, hostTileMapping.numTiles, "TileOffsets");
+    #ifdef DEBUG
+        printf("=== AFTER PHASE 2: Offset Computation ===\n");
+        printDeviceArrayOnHost(hostTileMapping.tileOffsets, hostTileMapping.numTiles, "TileOffsets");
+    #endif
 
     // Phase 3: Clear temp counters and build the tile mapping
-    cudaCheckError(cudaMemset(hostTileMapping.tempWriteCounters, 0, sizeof(int) * hostTileMapping.numTiles));
-    kernelBuildTileMapping<<<blocksPerGrid, threadsPerBlock>>>(deviceTileMapping);
+    // cudaCheckError(cudaMemset(hostTileMapping.tempWriteCounters, 0, sizeof(int) * hostTileMapping.numTiles));
+    // kernelBuildTileMapping<<<blocksPerGrid, threadsPerBlock>>>(deviceTileMapping);
+    // cudaDeviceSynchronize();
+
+    // Phase 3: Use prefix sum approach to build the tile mapping
+    // int sharedMemSize = 2 * threadsPerBlock * sizeof(int);
+    // kernelBuildOrderedTileMappingWithPrefixSum<<<hostTileMapping.numTiles, threadsPerBlock, sharedMemSize>>>(deviceTileMapping);
+    kernelBuildOrderedTileMappingWithPrefixSum<<<hostTileMapping.numTiles, threadsPerBlock>>>(deviceTileMapping);
     cudaDeviceSynchronize();
 
-    printf("=== AFTER PHASE 3: Tile Mapping Built ===\n");
-    debugTileMapping(&hostTileMapping, deviceTileMapping);
+    #ifdef DEBUG
+        printf("=== AFTER PHASE 3: Tile Mapping Built ===\n");
+        debugTileMapping(&hostTileMapping, deviceTileMapping);
+    #endif
 
     // Phase 4: Render tiles
     dim3 tileBlockDim(TILE_SIZE, TILE_SIZE);
