@@ -614,8 +614,12 @@ __global__ void kernelCountCirclesPerTile(TileCircleMapping* tileMapping) {
             float tileT = float(ty + 1) * TILE_SIZE / imageHeight;
 
             // Test if circle actually intersects the tile
-            if (circleInBoxConservative(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
+            // if (circleInBoxConservative(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
+            if (circleInBox(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
                 int tileId = ty * tileMapping->tilesPerRow + tx;
+                if (tileId == 3265) {
+                    printf("DEBUG: Circle %d intersects tile %d\n", circleIdx, tileId);
+                }
                 atomicAdd(&tileMapping->tileCircleCounts[tileId], 1);
             }
         }
@@ -623,55 +627,55 @@ __global__ void kernelCountCirclesPerTile(TileCircleMapping* tileMapping) {
 }
 
 // Phase 2: Build the tile-circle mapping
-__global__ void kernelBuildTileMapping(TileCircleMapping* tileMapping) {
-    int circleIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (circleIdx >= cuConstRendererParams.numCircles)
-        return;
+// __global__ void kernelBuildTileMapping(TileCircleMapping* tileMapping) {
+//     int circleIdx = blockIdx.x * blockDim.x + threadIdx.x;
+//     if (circleIdx >= cuConstRendererParams.numCircles)
+//         return;
 
-    // Read circle position and radius
-    int index3 = 3 * circleIdx;
-    float3 pos = *(float3*)(&cuConstRendererParams.position[index3]);
-    float rad = cuConstRendererParams.radius[circleIdx];
+//     // Read circle position and radius
+//     int index3 = 3 * circleIdx;
+//     float3 pos = *(float3*)(&cuConstRendererParams.position[index3]);
+//     float rad = cuConstRendererParams.radius[circleIdx];
 
-    // Convert to tile coordinates
-    float invTileSize = 1.0f / TILE_SIZE;
-    float imageWidth = (float)cuConstRendererParams.imageWidth;
-    float imageHeight = (float)cuConstRendererParams.imageHeight;
+//     // Convert to tile coordinates
+//     float invTileSize = 1.0f / TILE_SIZE;
+//     float imageWidth = (float)cuConstRendererParams.imageWidth;
+//     float imageHeight = (float)cuConstRendererParams.imageHeight;
 
-    // Convert normalized coordinates to pixel coordinates
-    float pixelX = pos.x * imageWidth;
-    float pixelY = pos.y * imageHeight;
-    float pixelRad = rad * max(imageWidth, imageHeight);
+//     // Convert normalized coordinates to pixel coordinates
+//     float pixelX = pos.x * imageWidth;
+//     float pixelY = pos.y * imageHeight;
+//     float pixelRad = rad * max(imageWidth, imageHeight);
 
-    // Find tile bounds
-    int minTileX = max(0, (int)((pixelX - pixelRad) * invTileSize));
-    int maxTileX = min(tileMapping->tilesPerRow - 1, (int)((pixelX + pixelRad) * invTileSize));
-    int minTileY = max(0, (int)((pixelY - pixelRad) * invTileSize));
-    int maxTileY = min(tileMapping->tilesPerCol - 1, (int)((pixelY + pixelRad) * invTileSize));
+//     // Find tile bounds
+//     int minTileX = max(0, (int)((pixelX - pixelRad) * invTileSize));
+//     int maxTileX = min(tileMapping->tilesPerRow - 1, (int)((pixelX + pixelRad) * invTileSize));
+//     int minTileY = max(0, (int)((pixelY - pixelRad) * invTileSize));
+//     int maxTileY = min(tileMapping->tilesPerCol - 1, (int)((pixelY + pixelRad) * invTileSize));
 
-    // For each potentially affected tile, add this circle to its list
-    for (int ty = minTileY; ty <= maxTileY; ty++) {
-        for (int tx = minTileX; tx <= maxTileX; tx++) {
-            // Calculate the tile bounds in normalized coordinates
-            float tileL = float(tx) * TILE_SIZE / imageWidth;
-            float tileR = float(tx + 1) * TILE_SIZE / imageWidth;
-            float tileB = float(ty) * TILE_SIZE / imageHeight;
-            float tileT = float(ty + 1) * TILE_SIZE / imageHeight;
+//     // For each potentially affected tile, add this circle to its list
+//     for (int ty = minTileY; ty <= maxTileY; ty++) {
+//         for (int tx = minTileX; tx <= maxTileX; tx++) {
+//             // Calculate the tile bounds in normalized coordinates
+//             float tileL = float(tx) * TILE_SIZE / imageWidth;
+//             float tileR = float(tx + 1) * TILE_SIZE / imageWidth;
+//             float tileB = float(ty) * TILE_SIZE / imageHeight;
+//             float tileT = float(ty + 1) * TILE_SIZE / imageHeight;
 
-            // Test if circle actually intersects the tile
-            if (circleInBoxConservative(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
-                int tileId = ty * tileMapping->tilesPerRow + tx;
+//             // Test if circle actually intersects the tile
+//             if (circleInBoxConservative(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
+//                 int tileId = ty * tileMapping->tilesPerRow + tx;
 
-                // Get write position using atomic counter
-                int writePos = atomicAdd(&tileMapping->tempWriteCounters[tileId], 1);
-                int actualPos = tileMapping->tileOffsets[tileId] + writePos;
+//                 // Get write position using atomic counter
+//                 int writePos = atomicAdd(&tileMapping->tempWriteCounters[tileId], 1);
+//                 int actualPos = tileMapping->tileOffsets[tileId] + writePos;
 
-                // Write the circle index to the tile's circle list
-                tileMapping->circleIndices[actualPos] = circleIdx;
-            }
-        }
-    }
-}
+//                 // Write the circle index to the tile's circle list
+//                 tileMapping->circleIndices[actualPos] = circleIdx;
+//             }
+//         }
+//     }
+// }
 
 // Phase 2: Build the tile-circle mapping (prefix sum approach)
 __global__ void kernelBuildOrderedTileMappingWithPrefixSum(TileCircleMapping* tileMapping) {
@@ -681,6 +685,9 @@ __global__ void kernelBuildOrderedTileMappingWithPrefixSum(TileCircleMapping* ti
     if (tileId >= tileMapping->numTiles)
         return;
 
+    // Debug only the problematic tile
+    bool debugTile = (tileId == 3265);
+
     // Calculate this tile's bounds
     int tileX = tileId % tileMapping->tilesPerRow;
     int tileY = tileId / tileMapping->tilesPerRow;
@@ -689,6 +696,7 @@ __global__ void kernelBuildOrderedTileMappingWithPrefixSum(TileCircleMapping* ti
     float imageWidth = (float)cuConstRendererParams.imageWidth;
     float imageHeight = (float)cuConstRendererParams.imageHeight;
 
+    // Calculate the tile bounds in normalized coordinates
     float tileL = float(tileX) * TILE_SIZE / imageWidth;
     float tileR = float(tileX + 1) * TILE_SIZE / imageWidth;
     float tileB = float(tileY) * TILE_SIZE / imageHeight;
@@ -706,13 +714,19 @@ __global__ void kernelBuildOrderedTileMappingWithPrefixSum(TileCircleMapping* ti
 
     int threadId = threadIdx.x;
     int numThreads = blockDim.x;
-
-    int writePos = tileMapping->tileOffsets[tileId];
+    // Initialize sharedWritePos for this tile
+    if (threadId == 0) {
+        sharedWritePos = tileMapping->tileOffsets[tileId];
+        if (debugTile) {
+            printf("DEBUG: Tile %d starting writePos = %d\n", tileId, sharedWritePos);
+        }
+    }
+    __syncthreads();
 
     // Process circles in chunks of blockDim.x
     for (int chunkStart = 0; chunkStart < cuConstRendererParams.numCircles; chunkStart += numThreads) {
         int circleIdx = chunkStart + threadId;
-
+        
         // Initialize intersection flag
         intersectionFlags[threadId] = 0;
 
@@ -723,8 +737,13 @@ __global__ void kernelBuildOrderedTileMappingWithPrefixSum(TileCircleMapping* ti
             float rad = cuConstRendererParams.radius[circleIdx];
 
             // Test if circle intersects the tile
-            if (circleInBoxConservative(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
+            // if (circleInBoxConservative(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
+            if (circleInBox(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
                 intersectionFlags[threadId] = 1;
+                if (debugTile) {
+                    printf("DEBUG: Chunk %d, Thread %d, Circle %d intersects\n", 
+                           chunkStart/numThreads, threadId, circleIdx);
+                }
             }
         }
 
@@ -741,7 +760,31 @@ __global__ void kernelBuildOrderedTileMappingWithPrefixSum(TileCircleMapping* ti
         // Write intersecting circles to global memory in order
         if (circleIdx < cuConstRendererParams.numCircles && intersectionFlags[threadId] == 1) {
             int localWritePos = prefixSum[threadId];
-            tileMapping->circleIndices[writePos + localWritePos] = circleIdx;
+            int globalWritePos = sharedWritePos + localWritePos;
+
+            // CRITICAL: Bounds check to prevent corruption
+            // int tileStartPos = tileMapping->tileOffsets[tileId];
+            // int tileEndPos = (tileId + 1 < tileMapping->numTiles) ? 
+            //                 tileMapping->tileOffsets[tileId + 1] : 
+            //                 tileStartPos + tileMapping->tileCircleCounts[tileId];
+
+            // if (globalWritePos < tileEndPos) {
+            //     tileMapping->circleIndices[globalWritePos] = circleIdx;
+            //     if (debugTile) {
+            //         printf("DEBUG: Successfully wrote Circle %d to pos %d\n", circleIdx, globalWritePos);
+            //     }
+            // } else {
+            //     if (debugTile) {
+            //         printf("DEBUG: OVERFLOW! Skipping Circle %d (would write to %d, max allowed %d)\n", 
+            //             circleIdx, globalWritePos, tileEndPos - 1);
+            //     }
+            // }
+            tileMapping->circleIndices[sharedWritePos + localWritePos] = circleIdx;
+
+            if (debugTile) {
+                printf("DEBUG: Writing Circle %d to global pos %d (shared=%d, local=%d)\n", 
+                       circleIdx, globalWritePos, sharedWritePos, localWritePos);
+            }
         }
 
         __syncthreads();
@@ -754,6 +797,11 @@ __global__ void kernelBuildOrderedTileMappingWithPrefixSum(TileCircleMapping* ti
             // Count total intersections in this chunk
             uint totalIntersections = prefixSum[numThreads - 1] + intersectionFlags[numThreads - 1];
             sharedWritePos += totalIntersections;
+
+            if (debugTile) {
+                printf("DEBUG: End of chunk, totalIntersections=%d, new sharedWritePos=%d\n", 
+                       totalIntersections, sharedWritePos);
+            }
         }
         __syncthreads();
     }
@@ -775,7 +823,23 @@ __global__ void kernelRenderTiles(TileCircleMapping* tileMapping) {
 
     // temporarily keep this code to avoid memory errors for debugging but switch to dynamic allocation later
     int numCircles = tileMapping->tileCircleCounts[tileIdx];
+    if (threadIdxId == 0 && numCircles > 0 && tileIdx == 3265) {
+        printf("Tile %d has %d circles\n", tileIdx, numCircles);
+        for (int i = tileMapping->tileOffsets[tileIdx]; i < tileMapping->tileOffsets[tileIdx] + numCircles; i++) {
+            int circleIdx = tileMapping->circleIndices[i];
+            printf("  Circle %d at index %d\n", circleIdx, i);
+        }
+    }
+    // for (int i = tileMapping->tileOffsets[tileIdx]; i < tileMapping->tileOffsets[tileIdx] + numCircles; i++) {
+    //     int circleIdx = tileMapping->circleIndices[i];
+    //     printf("  Circle %d\n", circleIdx);
+    // }
+    if (numCircles > MAX_CIRCLES_PER_TILE) {
+        printf("Warning: Tile %d has %d circles, exceeding MAX_CIRCLES_PER_TILE (%d). Clamping.\n",
+               tileIdx, numCircles, MAX_CIRCLES_PER_TILE);
+    }
     numCircles = min(numCircles, MAX_CIRCLES_PER_TILE);
+   
 
     // Cooperatively load circle data into shared memory
     for (int i = threadIdxId; i < numCircles; i += blockDim.x * blockDim.y) {
