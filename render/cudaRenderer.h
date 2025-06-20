@@ -12,7 +12,6 @@ struct TileCircleMapping {
     int* circleIndices;      // Flattened array of circle indices
     int* tileOffsets;        // Offset into circleIndices for each tile
     int* tileCircleCounts;   // Number of circles per tile
-    int* tempWriteCounters;  // Temporary counters for building mapping
     int numTiles;
     int tilesPerRow;
     int tilesPerCol;

@@ -10,6 +10,8 @@
 
 #include <thrust/scan.h>
 #include <thrust/device_ptr.h>
+#include <thrust/reduce.h>
+#include <thrust/functional.h>
 
 #include "cudaRenderer.h"
 #include "image.h"
@@ -55,21 +57,10 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 
 // Additional constants used for tile-based rendering implementation
 #define TILE_SIZE 16
-#define MAX_CIRCLES_PER_TILE 64
+#define MAX_CIRCLES_PER_TILE 1024
 #define SCAN_BLOCK_DIM 256  // Must match your block size and be power of 2
 
-// // Data structure for tile-circle mapping
-// struct TileCircleMapping {
-//     int* circleIndices;      // Flattened array of circle indices
-//     int* tileOffsets;        // Offset into circleIndices for each tile
-//     int* tileCircleCounts;   // Number of circles per tile
-//     int* tempWriteCounters;  // Temporary counters for building mapping
-//     int numTiles;
-//     int tilesPerRow;
-//     int tilesPerCol;
-// };
-
-// #define DEBUG
+#define DEBUG
 
 #ifdef DEBUG
 #define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
@@ -589,20 +580,54 @@ __global__ void kernelCountCirclesPerTile(TileCircleMapping* tileMapping) {
     float rad = cuConstRendererParams.radius[circleIdx];
 
     // Convert to tile coordinates
-    float invTileSize = 1.0f / TILE_SIZE;
     float imageWidth = (float)cuConstRendererParams.imageWidth;
     float imageHeight = (float)cuConstRendererParams.imageHeight;
 
-    // Convert normalized coordinates to pixel coordinates
-    float pixelX = pos.x * imageWidth;
-    float pixelY = pos.y * imageHeight;
-    float pixelRad = rad * max(imageWidth, imageHeight); // Use max for conservative estimate
+    ////////// Correct but inefficient intersection logic ///////////
+    // for (int tileY = 0; tileY < tileMapping->tilesPerCol; tileY++) {
+    //     for (int tileX = 0; tileX < tileMapping->tilesPerRow; tileX++) {
+    //         // Calculate the tile bounds in normalized coordinates (SAME AS PHASE 2)
+    //         float tileL = float(tileX) * TILE_SIZE / imageWidth;
+    //         float tileR = float(tileX + 1) * TILE_SIZE / imageWidth;
+    //         float tileB = float(tileY) * TILE_SIZE / imageHeight;
+    //         float tileT = float(tileY + 1) * TILE_SIZE / imageHeight;
 
-    // Find tile bounds
-    int minTileX = max(0, (int)((pixelX - pixelRad) * invTileSize));
-    int maxTileX = min(tileMapping->tilesPerRow - 1, (int)((pixelX + pixelRad) * invTileSize));
-    int minTileY = max(0, (int)((pixelY - pixelRad) * invTileSize));
-    int maxTileY = min(tileMapping->tilesPerCol - 1, (int)((pixelY + pixelRad) * invTileSize));
+    //         // Test if circle intersects the tile (SAME AS PHASE 2)
+    //         if (circleInBoxConservative(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
+    //             int tileId = tileY * tileMapping->tilesPerRow + tileX;
+    //             if (tileId == 3265) {
+    //                 printf("DEBUG FIXED: Circle %d intersects tile %d\n", circleIdx, tileId);
+    //             }
+    //             atomicAdd(&tileMapping->tileCircleCounts[tileId], 1);
+    //         }
+    //     }
+    // }
+
+    ///////////// More conservative tile range test /////////////
+    // CRITICAL: Since circleInBoxConservative expands the box by circleRadius,
+    // we need to expand our search range by the circle radius in NORMALIZED space
+    // plus additional margin for the tile expansion effect
+    
+    // Calculate the effective radius in normalized coordinates
+    float normRadX = rad; // Already in normalized coordinates
+    float normRadY = rad; // Already in normalized coordinates
+    
+    // Add extra margin to account for tile boundary effects and floating point precision
+    float marginX = (float)TILE_SIZE / imageWidth;  // One tile width in normalized coords
+    float marginY = (float)TILE_SIZE / imageHeight; // One tile height in normalized coords
+    
+    // Calculate expanded bounds in normalized coordinates
+    float minX = pos.x - normRadX - marginX;
+    float maxX = pos.x + normRadX + marginX;
+    float minY = pos.y - normRadY - marginY;
+    float maxY = pos.y + normRadY + marginY;
+    
+    // Convert to tile coordinates
+    float invTileSize = 1.0f / TILE_SIZE;
+    int minTileX = max(0, (int)floor(minX * imageWidth * invTileSize));
+    int maxTileX = min(tileMapping->tilesPerRow - 1, (int)floor(maxX * imageWidth * invTileSize));
+    int minTileY = max(0, (int)floor(minY * imageHeight * invTileSize));
+    int maxTileY = min(tileMapping->tilesPerCol - 1, (int)floor(maxY * imageHeight * invTileSize));
 
     // For each potentially affected tile, increment the circle count
     for (int ty = minTileY; ty <= maxTileY; ty++) {
@@ -614,68 +639,16 @@ __global__ void kernelCountCirclesPerTile(TileCircleMapping* tileMapping) {
             float tileT = float(ty + 1) * TILE_SIZE / imageHeight;
 
             // Test if circle actually intersects the tile
-            // if (circleInBoxConservative(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
-            if (circleInBox(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
+            if (circleInBoxConservative(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
                 int tileId = ty * tileMapping->tilesPerRow + tx;
-                if (tileId == 3265) {
-                    printf("DEBUG: Circle %d intersects tile %d\n", circleIdx, tileId);
-                }
+                // if (tileId == 3265) {
+                //     printf("DEBUG: Circle %d intersects tile %d\n", circleIdx, tileId);
+                // }
                 atomicAdd(&tileMapping->tileCircleCounts[tileId], 1);
             }
         }
     }
 }
-
-// Phase 2: Build the tile-circle mapping
-// __global__ void kernelBuildTileMapping(TileCircleMapping* tileMapping) {
-//     int circleIdx = blockIdx.x * blockDim.x + threadIdx.x;
-//     if (circleIdx >= cuConstRendererParams.numCircles)
-//         return;
-
-//     // Read circle position and radius
-//     int index3 = 3 * circleIdx;
-//     float3 pos = *(float3*)(&cuConstRendererParams.position[index3]);
-//     float rad = cuConstRendererParams.radius[circleIdx];
-
-//     // Convert to tile coordinates
-//     float invTileSize = 1.0f / TILE_SIZE;
-//     float imageWidth = (float)cuConstRendererParams.imageWidth;
-//     float imageHeight = (float)cuConstRendererParams.imageHeight;
-
-//     // Convert normalized coordinates to pixel coordinates
-//     float pixelX = pos.x * imageWidth;
-//     float pixelY = pos.y * imageHeight;
-//     float pixelRad = rad * max(imageWidth, imageHeight);
-
-//     // Find tile bounds
-//     int minTileX = max(0, (int)((pixelX - pixelRad) * invTileSize));
-//     int maxTileX = min(tileMapping->tilesPerRow - 1, (int)((pixelX + pixelRad) * invTileSize));
-//     int minTileY = max(0, (int)((pixelY - pixelRad) * invTileSize));
-//     int maxTileY = min(tileMapping->tilesPerCol - 1, (int)((pixelY + pixelRad) * invTileSize));
-
-//     // For each potentially affected tile, add this circle to its list
-//     for (int ty = minTileY; ty <= maxTileY; ty++) {
-//         for (int tx = minTileX; tx <= maxTileX; tx++) {
-//             // Calculate the tile bounds in normalized coordinates
-//             float tileL = float(tx) * TILE_SIZE / imageWidth;
-//             float tileR = float(tx + 1) * TILE_SIZE / imageWidth;
-//             float tileB = float(ty) * TILE_SIZE / imageHeight;
-//             float tileT = float(ty + 1) * TILE_SIZE / imageHeight;
-
-//             // Test if circle actually intersects the tile
-//             if (circleInBoxConservative(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
-//                 int tileId = ty * tileMapping->tilesPerRow + tx;
-
-//                 // Get write position using atomic counter
-//                 int writePos = atomicAdd(&tileMapping->tempWriteCounters[tileId], 1);
-//                 int actualPos = tileMapping->tileOffsets[tileId] + writePos;
-
-//                 // Write the circle index to the tile's circle list
-//                 tileMapping->circleIndices[actualPos] = circleIdx;
-//             }
-//         }
-//     }
-// }
 
 // Phase 2: Build the tile-circle mapping (prefix sum approach)
 __global__ void kernelBuildOrderedTileMappingWithPrefixSum(TileCircleMapping* tileMapping) {
@@ -684,9 +657,6 @@ __global__ void kernelBuildOrderedTileMappingWithPrefixSum(TileCircleMapping* ti
 
     if (tileId >= tileMapping->numTiles)
         return;
-
-    // Debug only the problematic tile
-    bool debugTile = (tileId == 3265);
 
     // Calculate this tile's bounds
     int tileX = tileId % tileMapping->tilesPerRow;
@@ -708,18 +678,12 @@ __global__ void kernelBuildOrderedTileMappingWithPrefixSum(TileCircleMapping* ti
     __shared__ uint prefixSum[SCAN_BLOCK_DIM];
     __shared__ volatile uint scratchArray[2 * SCAN_BLOCK_DIM];  // Required by scan
     __shared__ int sharedWritePos;  // For broadcasting writePos
-    // extern __shared__ int sharedData[];
-    // int* intersectionFlags = sharedData; // First part of shared memory
-    // int* prefixSum = &sharedData[blockDim.x]; // Second part for prefix sum
 
     int threadId = threadIdx.x;
     int numThreads = blockDim.x;
     // Initialize sharedWritePos for this tile
     if (threadId == 0) {
         sharedWritePos = tileMapping->tileOffsets[tileId];
-        if (debugTile) {
-            printf("DEBUG: Tile %d starting writePos = %d\n", tileId, sharedWritePos);
-        }
     }
     __syncthreads();
 
@@ -737,13 +701,8 @@ __global__ void kernelBuildOrderedTileMappingWithPrefixSum(TileCircleMapping* ti
             float rad = cuConstRendererParams.radius[circleIdx];
 
             // Test if circle intersects the tile
-            // if (circleInBoxConservative(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
-            if (circleInBox(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
+            if (circleInBoxConservative(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
                 intersectionFlags[threadId] = 1;
-                if (debugTile) {
-                    printf("DEBUG: Chunk %d, Thread %d, Circle %d intersects\n", 
-                           chunkStart/numThreads, threadId, circleIdx);
-                }
             }
         }
 
@@ -751,57 +710,21 @@ __global__ void kernelBuildOrderedTileMappingWithPrefixSum(TileCircleMapping* ti
 
         // Compute prefix sum of intersection flags
         // This tells us the write position for each intersecting circle
-        // sharedMemExclusiveScan(threadId, intersectionFlags, prefixSum, numThreads);
-
-        // FIXED: Correct function signature with all 5 parameters
         sharedMemExclusiveScan(threadId, intersectionFlags, prefixSum, scratchArray, numThreads);
         __syncthreads();
 
         // Write intersecting circles to global memory in order
         if (circleIdx < cuConstRendererParams.numCircles && intersectionFlags[threadId] == 1) {
             int localWritePos = prefixSum[threadId];
-            int globalWritePos = sharedWritePos + localWritePos;
-
-            // CRITICAL: Bounds check to prevent corruption
-            // int tileStartPos = tileMapping->tileOffsets[tileId];
-            // int tileEndPos = (tileId + 1 < tileMapping->numTiles) ? 
-            //                 tileMapping->tileOffsets[tileId + 1] : 
-            //                 tileStartPos + tileMapping->tileCircleCounts[tileId];
-
-            // if (globalWritePos < tileEndPos) {
-            //     tileMapping->circleIndices[globalWritePos] = circleIdx;
-            //     if (debugTile) {
-            //         printf("DEBUG: Successfully wrote Circle %d to pos %d\n", circleIdx, globalWritePos);
-            //     }
-            // } else {
-            //     if (debugTile) {
-            //         printf("DEBUG: OVERFLOW! Skipping Circle %d (would write to %d, max allowed %d)\n", 
-            //             circleIdx, globalWritePos, tileEndPos - 1);
-            //     }
-            // }
             tileMapping->circleIndices[sharedWritePos + localWritePos] = circleIdx;
-
-            if (debugTile) {
-                printf("DEBUG: Writing Circle %d to global pos %d (shared=%d, local=%d)\n", 
-                       circleIdx, globalWritePos, sharedWritePos, localWritePos);
-            }
         }
 
         __syncthreads();
 
         if (threadId == 0) {
-            // // Count total intersections in this chunk
-            // int totalIntersections = prefixSum[numThreads - 1] + intersectionFlags[numThreads - 1];
-            // writePos += totalIntersections;
-
             // Count total intersections in this chunk
             uint totalIntersections = prefixSum[numThreads - 1] + intersectionFlags[numThreads - 1];
             sharedWritePos += totalIntersections;
-
-            if (debugTile) {
-                printf("DEBUG: End of chunk, totalIntersections=%d, new sharedWritePos=%d\n", 
-                       totalIntersections, sharedWritePos);
-            }
         }
         __syncthreads();
     }
@@ -823,21 +746,11 @@ __global__ void kernelRenderTiles(TileCircleMapping* tileMapping) {
 
     // temporarily keep this code to avoid memory errors for debugging but switch to dynamic allocation later
     int numCircles = tileMapping->tileCircleCounts[tileIdx];
-    if (threadIdxId == 0 && numCircles > 0 && tileIdx == 3265) {
-        printf("Tile %d has %d circles\n", tileIdx, numCircles);
-        for (int i = tileMapping->tileOffsets[tileIdx]; i < tileMapping->tileOffsets[tileIdx] + numCircles; i++) {
-            int circleIdx = tileMapping->circleIndices[i];
-            printf("  Circle %d at index %d\n", circleIdx, i);
-        }
-    }
-    // for (int i = tileMapping->tileOffsets[tileIdx]; i < tileMapping->tileOffsets[tileIdx] + numCircles; i++) {
-    //     int circleIdx = tileMapping->circleIndices[i];
-    //     printf("  Circle %d\n", circleIdx);
+    
+    // if (numCircles > MAX_CIRCLES_PER_TILE) {
+    //     printf("Warning: Tile %d has %d circles, exceeding MAX_CIRCLES_PER_TILE (%d). Clamping.\n",
+    //            tileIdx, numCircles, MAX_CIRCLES_PER_TILE);
     // }
-    if (numCircles > MAX_CIRCLES_PER_TILE) {
-        printf("Warning: Tile %d has %d circles, exceeding MAX_CIRCLES_PER_TILE (%d). Clamping.\n",
-               tileIdx, numCircles, MAX_CIRCLES_PER_TILE);
-    }
     numCircles = min(numCircles, MAX_CIRCLES_PER_TILE);
    
 
@@ -926,154 +839,6 @@ __global__ void kernelRenderTiles(TileCircleMapping* tileMapping) {
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
-// CUDA Array Debugging Methods
-
-// ============================================================================
-// METHOD 1: Device-side printing (within kernels)
-// ============================================================================
-
-__global__ void debugKernel(int* deviceArray, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // Print from specific threads only to avoid overwhelming output
-    if (idx == 0) {
-        printf("=== Device Array Debug ===\n");
-        for (int i = 0; i < min(size, 20); i++) { // Limit to first 20 elements
-            printf("deviceArray[%d] = %d\n", i, deviceArray[i]);
-        }
-    }
-}
-
-// Call this after your kernel to debug device arrays
-void debugDeviceArray(int* devicePtr, int size, const char* arrayName) {
-    printf("\n--- Debugging %s ---\n", arrayName);
-    debugKernel<<<1, 1>>>(devicePtr, size);
-    cudaDeviceSynchronize();
-    printf("--- End %s ---\n\n", arrayName);
-}
-
-// ============================================================================
-// METHOD 2: Copy to host and print (most reliable)
-// ============================================================================
-
-void printDeviceArrayOnHost(int* devicePtr, int size, const char* arrayName) {
-    // Allocate host memory
-    int* hostArray = new int[size];
-    
-    // Copy device data to host
-    cudaMemcpy(hostArray, devicePtr, size * sizeof(int), cudaMemcpyDeviceToHost);
-    
-    printf("\n=== %s (copied from device) ===\n", arrayName);
-    for (int i = 0; i < min(size, 50) ; i++) { // Limit output
-        // if (hostArray[i] == 0) continue; // Skip zero values for clarity
-        printf("%s[%d] = %d\n", arrayName, i, hostArray[i]);
-        if (i > 0 && i % 10 == 0) printf("\n"); // Add spacing every 10 elements
-    }
-    if (size > 50) {
-        printf("... (showing first 50 of %d elements)\n", size);
-    }
-    printf("=== End %s ===\n\n", arrayName);
-    
-    delete[] hostArray;
-}
-
-// For float arrays
-void printDeviceFloatArrayOnHost(float* devicePtr, int size, const char* arrayName) {
-    float* hostArray = new float[size];
-    cudaMemcpy(hostArray, devicePtr, size * sizeof(float), cudaMemcpyDeviceToHost);
-    
-    printf("\n=== %s (float array) ===\n", arrayName);
-    for (int i = 0; i < min(size, 30); i++) {
-        printf("%s[%d] = %.4f\n", arrayName, i, hostArray[i]);
-    }
-    if (size > 30) printf("... (showing first 30 of %d elements)\n", size);
-    printf("=== End %s ===\n\n", arrayName);
-    
-    delete[] hostArray;
-}
-
-// ============================================================================
-// METHOD 3: Host array printing (simple)
-// ============================================================================
-
-void printHostArray(int* hostPtr, int size, const char* arrayName) {
-    printf("\n=== %s (host array) ===\n", arrayName);
-    for (int i = 0; i < min(size, 50); i++) {
-        printf("%s[%d] = %d ", arrayName, i, hostPtr[i]);
-        if ((i + 1) % 10 == 0) printf("\n"); // New line every 10 elements
-    }
-    if (size > 50) printf("\n... (showing first 50 of %d elements)", size);
-    printf("\n=== End %s ===\n\n", arrayName);
-}
-
-// ============================================================================
-// METHOD 4: Debug your specific tile mapping structures
-// ============================================================================
-
-void debugTileMapping(TileCircleMapping* hostMapping, TileCircleMapping* deviceMapping) {
-    printf("\n========== TILE MAPPING DEBUG ==========\n");
-    
-    // Print basic info
-    printf("Tiles per row: %d\n", hostMapping->tilesPerRow);
-    printf("Tiles per col: %d\n", hostMapping->tilesPerCol);
-    printf("Total tiles: %d\n", hostMapping->numTiles);
-    
-    // Debug tile circle counts
-    printDeviceArrayOnHost(hostMapping->tileCircleCounts, hostMapping->numTiles, "TileCircleCounts");
-    
-    // Debug tile offsets
-    printDeviceArrayOnHost(hostMapping->tileOffsets, hostMapping->numTiles, "TileOffsets");
-    
-    // Debug first few circle indices (limited because this can be very large)
-    int totalCircleRefs = 0;
-    int* tempCounts = new int[hostMapping->numTiles];
-    cudaMemcpy(tempCounts, hostMapping->tileCircleCounts, 
-               hostMapping->numTiles * sizeof(int), cudaMemcpyDeviceToHost);
-    
-    for (int i = 0; i < hostMapping->numTiles; i++) {
-        totalCircleRefs += tempCounts[i];
-    }
-    printf("Total circle references: %d\n", totalCircleRefs);
-    
-    // Show circle indices for first few tiles that have circles
-    int* tempOffsets = new int[hostMapping->numTiles];
-    cudaMemcpy(tempOffsets, hostMapping->tileOffsets, 
-               hostMapping->numTiles * sizeof(int), cudaMemcpyDeviceToHost);
-    
-    printf("\n--- Circle indices for first 5 non-empty tiles ---\n");
-    int tilesShown = 0;
-    for (int tileId = 0; tileId < hostMapping->numTiles && tilesShown < 5; tileId++) {
-        if (tempCounts[tileId] > 0) {
-            printf("Tile %d has %d circles starting at offset %d:\n", 
-                   tileId, tempCounts[tileId], tempOffsets[tileId]);
-            
-            // Copy and print circle indices for this tile
-            int* circleIndices = new int[tempCounts[tileId]];
-            cudaMemcpy(circleIndices, 
-                      &hostMapping->circleIndices[tempOffsets[tileId]], 
-                      tempCounts[tileId] * sizeof(int), 
-                      cudaMemcpyDeviceToHost);
-            
-            for (int i = 0; i < min(tempCounts[tileId], 10); i++) {
-                printf("  Circle[%d] = %d\n", i, circleIndices[i]);
-            }
-            if (tempCounts[tileId] > 10) {
-                printf("  ... (%d more circles)\n", tempCounts[tileId] - 10);
-            }
-            printf("\n");
-            
-            delete[] circleIndices;
-            tilesShown++;
-        }
-    }
-    
-    delete[] tempCounts;
-    delete[] tempOffsets;
-    printf("========== END TILE MAPPING DEBUG ==========\n\n");
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
 
 CudaRenderer::CudaRenderer() {
     image = NULL;
@@ -1115,7 +880,6 @@ CudaRenderer::~CudaRenderer() {
     if (hostTileMapping.circleIndices) cudaFree(hostTileMapping.circleIndices);
     if (hostTileMapping.tileOffsets) cudaFree(hostTileMapping.tileOffsets);
     if (hostTileMapping.tileCircleCounts) cudaFree(hostTileMapping.tileCircleCounts);
-    if (hostTileMapping.tempWriteCounters) cudaFree(hostTileMapping.tempWriteCounters);
     if (deviceTileMapping) cudaFree(deviceTileMapping);
 }
 
@@ -1238,10 +1002,10 @@ CudaRenderer::setup() {
 
     cudaCheckError(cudaMalloc(&hostTileMapping.tileCircleCounts, sizeof(int) * numTiles));
     cudaCheckError(cudaMalloc(&hostTileMapping.tileOffsets, sizeof(int) * numTiles));
-    cudaCheckError(cudaMalloc(&hostTileMapping.tempWriteCounters, sizeof(int) * numTiles));
 
     // Worst case: every circle affects every tile
-    cudaCheckError(cudaMalloc(&hostTileMapping.circleIndices, sizeof(int) * numCircles * numTiles));
+    // cudaCheckError(cudaMalloc(&hostTileMapping.circleIndices, sizeof(int) * numCircles * numTiles));
+    hostTileMapping.circleIndices = nullptr; 
 
     // Copy tile mapping to device
     cudaCheckError(cudaMalloc(&deviceTileMapping, sizeof(TileCircleMapping)));
@@ -1338,43 +1102,35 @@ void CudaRenderer::render() {
     int blocksPerGrid = (numCircles + threadsPerBlock - 1) / threadsPerBlock;
 
     kernelCountCirclesPerTile<<<blocksPerGrid, threadsPerBlock>>>(deviceTileMapping);
-    cudaDeviceSynchronize();
-    
-    #ifdef DEBUG
-        printf("=== AFTER PHASE 1: Circle Counting ===\n");
-        printDeviceArrayOnHost(hostTileMapping.tileCircleCounts, hostTileMapping.numTiles, "TileCircleCounts");
-    #endif
+    cudaCheckError(cudaDeviceSynchronize());
 
     // Phase 2: Compute tile offsets using exclusive scan
     thrust::device_ptr<int> dev_counts(hostTileMapping.tileCircleCounts);
     thrust::device_ptr<int> dev_offsets(hostTileMapping.tileOffsets);
     thrust::exclusive_scan(dev_counts, dev_counts + hostTileMapping.numTiles, dev_offsets);
 
-    #ifdef DEBUG
-        printf("=== AFTER PHASE 2: Offset Computation ===\n");
-        printDeviceArrayOnHost(hostTileMapping.tileOffsets, hostTileMapping.numTiles, "TileOffsets");
-    #endif
+    // Allocate circle indices array dynamically based on total counts
+    // Alternative: Use thrust::reduce to get total directly
+    int totalCircleTilePairs = thrust::reduce(dev_counts, dev_counts + hostTileMapping.numTiles, 0, thrust::plus<int>());
 
-    // Phase 3: Clear temp counters and build the tile mapping
-    // cudaCheckError(cudaMemset(hostTileMapping.tempWriteCounters, 0, sizeof(int) * hostTileMapping.numTiles));
-    // kernelBuildTileMapping<<<blocksPerGrid, threadsPerBlock>>>(deviceTileMapping);
-    // cudaDeviceSynchronize();
+    // Allocate circleIndices array with exact size needed
+    if (hostTileMapping.circleIndices != nullptr) {
+        cudaFree(hostTileMapping.circleIndices);
+    }
+    
+    cudaCheckError(cudaMalloc(&hostTileMapping.circleIndices, sizeof(int) * totalCircleTilePairs));
+    
+    // Update device copy of tile mapping
+    cudaCheckError(cudaMemcpy(&deviceTileMapping->circleIndices, &hostTileMapping.circleIndices, sizeof(int*), cudaMemcpyHostToDevice));
 
     // Phase 3: Use prefix sum approach to build the tile mapping
-    // int sharedMemSize = 2 * threadsPerBlock * sizeof(int);
-    // kernelBuildOrderedTileMappingWithPrefixSum<<<hostTileMapping.numTiles, threadsPerBlock, sharedMemSize>>>(deviceTileMapping);
     kernelBuildOrderedTileMappingWithPrefixSum<<<hostTileMapping.numTiles, threadsPerBlock>>>(deviceTileMapping);
-    cudaDeviceSynchronize();
-
-    #ifdef DEBUG
-        printf("=== AFTER PHASE 3: Tile Mapping Built ===\n");
-        debugTileMapping(&hostTileMapping, deviceTileMapping);
-    #endif
+    cudaCheckError(cudaDeviceSynchronize());
 
     // Phase 4: Render tiles
     dim3 tileBlockDim(TILE_SIZE, TILE_SIZE);
     int numTileBlocks = hostTileMapping.numTiles;
 
     kernelRenderTiles<<<numTileBlocks, tileBlockDim>>>(deviceTileMapping);
-    cudaDeviceSynchronize();
+    cudaCheckError(cudaDeviceSynchronize());
 }
