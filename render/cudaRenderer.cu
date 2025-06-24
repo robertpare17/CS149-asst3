@@ -56,11 +56,11 @@ __constant__ float  cuConstNoise1DValueTable[256];
 __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 
 // Additional constants used for tile-based rendering implementation
-#define TILE_SIZE 16
+#define TILE_SIZE 32
 #define MAX_CIRCLES_PER_TILE 1024
 #define SCAN_BLOCK_DIM 256  // Must match your block size and be power of 2
 
-#define DEBUG
+// #define DEBUG
 
 #ifdef DEBUG
 #define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
@@ -482,10 +482,10 @@ __global__ void kernelRenderCircles() {
     
     // Define the pixel as a box in normalized coordinates
     // Each pixel represents a small box from its edges
-    float pixelBoxL = invWidth * static_cast<float>(pixelX);
-    float pixelBoxR = invWidth * static_cast<float>(pixelX + 1);
-    float pixelBoxB = invHeight * static_cast<float>(pixelY);
-    float pixelBoxT = invHeight * static_cast<float>(pixelY + 1);
+    // float pixelBoxL = invWidth * static_cast<float>(pixelX);
+    // float pixelBoxR = invWidth * static_cast<float>(pixelX + 1);
+    // float pixelBoxB = invHeight * static_cast<float>(pixelY);
+    // float pixelBoxT = invHeight * static_cast<float>(pixelY + 1);
     
     // Read the pixel color from the image data
     int offset = 4 * (pixelY * imageWidth + pixelX);
@@ -502,17 +502,15 @@ __global__ void kernelRenderCircles() {
         
         // OPTIMIZATION 1: Fast conservative test
         // If this returns 0, we can immediately skip this circle
-        if (!circleInBoxConservative(p.x, p.y, rad, pixelBoxL, pixelBoxR, pixelBoxT, pixelBoxB)) {
-            continue; // Circle definitely doesn't intersect this pixel
-        }
+        // if (!circleInBoxConservative(p.x, p.y, rad, pixelBoxL, pixelBoxR, pixelBoxT, pixelBoxB)) {
+        //     continue; // Circle definitely doesn't intersect this pixel
+        // }
         
         // OPTIMIZATION 2: For cases where we need precise testing
         // (Optional: you can use this for even more precision, though the point-in-circle test below might be sufficient)
-        /*
-        if (!circleInBox(p.x, p.y, rad, pixelBoxL, pixelBoxR, pixelBoxT, pixelBoxB)) {
-            continue; // Circle definitely doesn't intersect this pixel
-        }
-        */
+        // if (!circleInBox(p.x, p.y, rad, pixelBoxL, pixelBoxR, pixelBoxT, pixelBoxB)) {
+        //     continue; // Circle definitely doesn't intersect this pixel
+        // }
         
         // At this point, circle *might* intersect pixel
         // Do the precise point-in-circle test for the pixel center
@@ -529,25 +527,25 @@ __global__ void kernelRenderCircles() {
         float3 rgb;
         float alpha;
         
-        if (cuConstRendererParams.sceneName == SNOWFLAKES || 
-            cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+        // if (cuConstRendererParams.sceneName == SNOWFLAKES || 
+        //     cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
             
-            const float kCircleMaxAlpha = .5f;
-            const float falloffScale = 4.f;
+        //     const float kCircleMaxAlpha = .5f;
+        //     const float falloffScale = 4.f;
             
-            float normPixelDist = sqrt(pixelDist) / rad;
-            rgb = lookupColor(normPixelDist);
+        //     float normPixelDist = sqrt(pixelDist) / rad;
+        //     rgb = lookupColor(normPixelDist);
             
-            float maxAlpha = .6f + .4f * (1.f - p.z);
-            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
-            alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+        //     float maxAlpha = .6f + .4f * (1.f - p.z);
+        //     maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+        //     alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
             
-        } else {
+        // } else {
             // Simple: each circle has an assigned color
             int colorIndex3 = 3 * circleIdx;
             rgb = *(float3*)&(cuConstRendererParams.color[colorIndex3]);
             alpha = .5f;
-        }
+        // }
         
         // Blend this circle's contribution with accumulated color
         float oneMinusAlpha = 1.f - alpha;
@@ -1004,8 +1002,8 @@ CudaRenderer::setup() {
     cudaCheckError(cudaMalloc(&hostTileMapping.tileOffsets, sizeof(int) * numTiles));
 
     // Worst case: every circle affects every tile
-    // cudaCheckError(cudaMalloc(&hostTileMapping.circleIndices, sizeof(int) * numCircles * numTiles));
-    hostTileMapping.circleIndices = nullptr; 
+    cudaCheckError(cudaMalloc(&hostTileMapping.circleIndices, sizeof(int) * numCircles * numTiles));
+    // hostTileMapping.circleIndices = nullptr; 
 
     // Copy tile mapping to device
     cudaCheckError(cudaMalloc(&deviceTileMapping, sizeof(TileCircleMapping)));
@@ -1084,7 +1082,7 @@ CudaRenderer::advanceAnimation() {
 // void CudaRenderer::render() {
     
 //     // Use 2D thread blocks for pixel-based parallelization
-//     dim3 blockDim(16, 16);  // 256 threads per block
+//     dim3 blockDim(32, 32);  // 256 threads per block
 //     dim3 gridDim(
 //         (image->width + blockDim.x - 1) / blockDim.x,
 //         (image->height + blockDim.y - 1) / blockDim.y);
@@ -1111,17 +1109,31 @@ void CudaRenderer::render() {
 
     // Allocate circle indices array dynamically based on total counts
     // Alternative: Use thrust::reduce to get total directly
-    int totalCircleTilePairs = thrust::reduce(dev_counts, dev_counts + hostTileMapping.numTiles, 0, thrust::plus<int>());
+    // int totalCircleTilePairs = thrust::reduce(dev_counts, dev_counts + hostTileMapping.numTiles, 0, thrust::plus<int>());
 
-    // Allocate circleIndices array with exact size needed
-    if (hostTileMapping.circleIndices != nullptr) {
-        cudaFree(hostTileMapping.circleIndices);
-    }
+    // int totalCircleTilePairs = 0;
+    // cudaCheckError(cudaMemcpy(&totalCircleTilePairs, 
+    //                           &hostTileMapping.tileOffsets[hostTileMapping.numTiles - 1], 
+    //                           sizeof(int), 
+    //                           cudaMemcpyDeviceToHost));
     
-    cudaCheckError(cudaMalloc(&hostTileMapping.circleIndices, sizeof(int) * totalCircleTilePairs));
+    // int lastTileCount = 0;
+    // cudaCheckError(cudaMemcpy(&lastTileCount, 
+    //                           &hostTileMapping.tileCircleCounts[hostTileMapping.numTiles - 1], 
+    //                           sizeof(int), 
+    //                           cudaMemcpyDeviceToHost));
     
-    // Update device copy of tile mapping
-    cudaCheckError(cudaMemcpy(&deviceTileMapping->circleIndices, &hostTileMapping.circleIndices, sizeof(int*), cudaMemcpyHostToDevice));
+    // totalCircleTilePairs += lastTileCount;
+
+    // // Allocate circleIndices array with exact size needed
+    // if (hostTileMapping.circleIndices != nullptr) {
+    //     cudaFree(hostTileMapping.circleIndices);
+    // }
+    
+    // cudaCheckError(cudaMalloc(&hostTileMapping.circleIndices, sizeof(int) * totalCircleTilePairs));
+    
+    // // Update device copy of tile mapping
+    // cudaCheckError(cudaMemcpy(&deviceTileMapping->circleIndices, &hostTileMapping.circleIndices, sizeof(int*), cudaMemcpyHostToDevice));
 
     // Phase 3: Use prefix sum approach to build the tile mapping
     kernelBuildOrderedTileMappingWithPrefixSum<<<hostTileMapping.numTiles, threadsPerBlock>>>(deviceTileMapping);
