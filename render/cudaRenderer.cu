@@ -1002,8 +1002,8 @@ CudaRenderer::setup() {
     cudaCheckError(cudaMalloc(&hostTileMapping.tileOffsets, sizeof(int) * numTiles));
 
     // Worst case: every circle affects every tile
-    cudaCheckError(cudaMalloc(&hostTileMapping.circleIndices, sizeof(int) * numCircles * numTiles));
-    // hostTileMapping.circleIndices = nullptr; 
+    // cudaCheckError(cudaMalloc(&hostTileMapping.circleIndices, sizeof(int) * numCircles * numTiles));
+    hostTileMapping.circleIndices = nullptr; 
 
     // Copy tile mapping to device
     cudaCheckError(cudaMalloc(&deviceTileMapping, sizeof(TileCircleMapping)));
@@ -1111,29 +1111,29 @@ void CudaRenderer::render() {
     // Alternative: Use thrust::reduce to get total directly
     // int totalCircleTilePairs = thrust::reduce(dev_counts, dev_counts + hostTileMapping.numTiles, 0, thrust::plus<int>());
 
-    // int totalCircleTilePairs = 0;
-    // cudaCheckError(cudaMemcpy(&totalCircleTilePairs, 
-    //                           &hostTileMapping.tileOffsets[hostTileMapping.numTiles - 1], 
-    //                           sizeof(int), 
-    //                           cudaMemcpyDeviceToHost));
+    int totalCircleTilePairs = 0;
+    cudaCheckError(cudaMemcpy(&totalCircleTilePairs, 
+                              &hostTileMapping.tileOffsets[hostTileMapping.numTiles - 1], 
+                              sizeof(int), 
+                              cudaMemcpyDeviceToHost));
     
-    // int lastTileCount = 0;
-    // cudaCheckError(cudaMemcpy(&lastTileCount, 
-    //                           &hostTileMapping.tileCircleCounts[hostTileMapping.numTiles - 1], 
-    //                           sizeof(int), 
-    //                           cudaMemcpyDeviceToHost));
+    int lastTileCount = 0;
+    cudaCheckError(cudaMemcpy(&lastTileCount, 
+                              &hostTileMapping.tileCircleCounts[hostTileMapping.numTiles - 1], 
+                              sizeof(int), 
+                              cudaMemcpyDeviceToHost));
     
-    // totalCircleTilePairs += lastTileCount;
+    totalCircleTilePairs += lastTileCount;
 
-    // // Allocate circleIndices array with exact size needed
-    // if (hostTileMapping.circleIndices != nullptr) {
-    //     cudaFree(hostTileMapping.circleIndices);
-    // }
+    // Allocate circleIndices array with exact size needed
+    if (hostTileMapping.circleIndices != nullptr) {
+        cudaFree(hostTileMapping.circleIndices);
+    }
     
-    // cudaCheckError(cudaMalloc(&hostTileMapping.circleIndices, sizeof(int) * totalCircleTilePairs));
+    cudaCheckError(cudaMalloc(&hostTileMapping.circleIndices, sizeof(int) * totalCircleTilePairs));
     
-    // // Update device copy of tile mapping
-    // cudaCheckError(cudaMemcpy(&deviceTileMapping->circleIndices, &hostTileMapping.circleIndices, sizeof(int*), cudaMemcpyHostToDevice));
+    // Update device copy of tile mapping
+    cudaCheckError(cudaMemcpy(&deviceTileMapping->circleIndices, &hostTileMapping.circleIndices, sizeof(int*), cudaMemcpyHostToDevice));
 
     // Phase 3: Use prefix sum approach to build the tile mapping
     kernelBuildOrderedTileMappingWithPrefixSum<<<hostTileMapping.numTiles, threadsPerBlock>>>(deviceTileMapping);
