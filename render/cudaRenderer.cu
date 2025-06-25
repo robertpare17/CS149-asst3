@@ -12,6 +12,7 @@
 #include <thrust/device_ptr.h>
 #include <thrust/reduce.h>
 #include <thrust/functional.h>
+#include <thrust/extrema.h>
 
 #include "cudaRenderer.h"
 #include "image.h"
@@ -61,6 +62,12 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 #define SCAN_BLOCK_DIM 256  // Must match your block size and be power of 2
 
 // #define DEBUG
+
+// Define the rendering strategy by uncommenting one of the following lines:
+// Only ONE of these should be defined at a time
+#define USE_MULTIPASS // most performant for many circles per tile
+// #define USE_GLOBAL_MEMORY
+// #define USE_HYBRID
 
 #ifdef DEBUG
 #define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
@@ -462,6 +469,9 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 // Correct (but slow) implementation of kernelRenderCircles that parallelizes across pixels
 // Each thread renders a pixel, and processes all circles that
 // intersect that pixel.  
+// For most scenes, this is very slow. However, for scenes with extremely few circles (e.g. rgb)
+// this is actually faster than the tile-based implementation since there is no overhead
+// of building the tile mapping and no need to load circles into shared memory.
 __global__ void kernelRenderCircles() {
     
     int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
@@ -480,13 +490,6 @@ __global__ void kernelRenderCircles() {
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                          invHeight * (static_cast<float>(pixelY) + 0.5f));
     
-    // Define the pixel as a box in normalized coordinates
-    // Each pixel represents a small box from its edges
-    // float pixelBoxL = invWidth * static_cast<float>(pixelX);
-    // float pixelBoxR = invWidth * static_cast<float>(pixelX + 1);
-    // float pixelBoxB = invHeight * static_cast<float>(pixelY);
-    // float pixelBoxT = invHeight * static_cast<float>(pixelY + 1);
-    
     // Read the pixel color from the image data
     int offset = 4 * (pixelY * imageWidth + pixelX);
     float4 pixelColor = *(float4*)(&cuConstRendererParams.imageData[offset]);
@@ -500,19 +503,6 @@ __global__ void kernelRenderCircles() {
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
         float rad = cuConstRendererParams.radius[circleIdx];
         
-        // OPTIMIZATION 1: Fast conservative test
-        // If this returns 0, we can immediately skip this circle
-        // if (!circleInBoxConservative(p.x, p.y, rad, pixelBoxL, pixelBoxR, pixelBoxT, pixelBoxB)) {
-        //     continue; // Circle definitely doesn't intersect this pixel
-        // }
-        
-        // OPTIMIZATION 2: For cases where we need precise testing
-        // (Optional: you can use this for even more precision, though the point-in-circle test below might be sufficient)
-        // if (!circleInBox(p.x, p.y, rad, pixelBoxL, pixelBoxR, pixelBoxT, pixelBoxB)) {
-        //     continue; // Circle definitely doesn't intersect this pixel
-        // }
-        
-        // At this point, circle *might* intersect pixel
         // Do the precise point-in-circle test for the pixel center
         float diffX = p.x - pixelCenterNorm.x;
         float diffY = p.y - pixelCenterNorm.y;
@@ -527,25 +517,10 @@ __global__ void kernelRenderCircles() {
         float3 rgb;
         float alpha;
         
-        // if (cuConstRendererParams.sceneName == SNOWFLAKES || 
-        //     cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
-            
-        //     const float kCircleMaxAlpha = .5f;
-        //     const float falloffScale = 4.f;
-            
-        //     float normPixelDist = sqrt(pixelDist) / rad;
-        //     rgb = lookupColor(normPixelDist);
-            
-        //     float maxAlpha = .6f + .4f * (1.f - p.z);
-        //     maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
-        //     alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
-            
-        // } else {
-            // Simple: each circle has an assigned color
-            int colorIndex3 = 3 * circleIdx;
-            rgb = *(float3*)&(cuConstRendererParams.color[colorIndex3]);
-            alpha = .5f;
-        // }
+        // Simple: each circle has an assigned color
+        int colorIndex3 = 3 * circleIdx;
+        rgb = *(float3*)&(cuConstRendererParams.color[colorIndex3]);
+        alpha = .5f;
         
         // Blend this circle's contribution with accumulated color
         float oneMinusAlpha = 1.f - alpha;
@@ -580,26 +555,6 @@ __global__ void kernelCountCirclesPerTile(TileCircleMapping* tileMapping) {
     // Convert to tile coordinates
     float imageWidth = (float)cuConstRendererParams.imageWidth;
     float imageHeight = (float)cuConstRendererParams.imageHeight;
-
-    ////////// Correct but inefficient intersection logic ///////////
-    // for (int tileY = 0; tileY < tileMapping->tilesPerCol; tileY++) {
-    //     for (int tileX = 0; tileX < tileMapping->tilesPerRow; tileX++) {
-    //         // Calculate the tile bounds in normalized coordinates (SAME AS PHASE 2)
-    //         float tileL = float(tileX) * TILE_SIZE / imageWidth;
-    //         float tileR = float(tileX + 1) * TILE_SIZE / imageWidth;
-    //         float tileB = float(tileY) * TILE_SIZE / imageHeight;
-    //         float tileT = float(tileY + 1) * TILE_SIZE / imageHeight;
-
-    //         // Test if circle intersects the tile (SAME AS PHASE 2)
-    //         if (circleInBoxConservative(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
-    //             int tileId = tileY * tileMapping->tilesPerRow + tileX;
-    //             if (tileId == 3265) {
-    //                 printf("DEBUG FIXED: Circle %d intersects tile %d\n", circleIdx, tileId);
-    //             }
-    //             atomicAdd(&tileMapping->tileCircleCounts[tileId], 1);
-    //         }
-    //     }
-    // }
 
     ///////////// More conservative tile range test /////////////
     // CRITICAL: Since circleInBoxConservative expands the box by circleRadius,
@@ -639,9 +594,7 @@ __global__ void kernelCountCirclesPerTile(TileCircleMapping* tileMapping) {
             // Test if circle actually intersects the tile
             if (circleInBoxConservative(pos.x, pos.y, rad, tileL, tileR, tileT, tileB)) {
                 int tileId = ty * tileMapping->tilesPerRow + tx;
-                // if (tileId == 3265) {
-                //     printf("DEBUG: Circle %d intersects tile %d\n", circleIdx, tileId);
-                // }
+                // Increment the count of circles for this tile
                 atomicAdd(&tileMapping->tileCircleCounts[tileId], 1);
             }
         }
@@ -729,6 +682,9 @@ __global__ void kernelBuildOrderedTileMappingWithPrefixSum(TileCircleMapping* ti
 }
 
 // Phase 3: Tile-based rendering kernel
+// This is a specialized kernel used for the PATTERN scene
+// It is the same as the kernelRenderTilesMultiPass, but without the multi-pass logic or the flexibility
+// to render Snowflakes since this is just used to pass the PATTERN scene benchmark
 __global__ void kernelRenderTiles(TileCircleMapping* tileMapping) {
     // Each block processes one tile
     int tileIdx = blockIdx.x;
@@ -742,13 +698,7 @@ __global__ void kernelRenderTiles(TileCircleMapping* tileMapping) {
     __shared__ float sharedCirclesRadius[MAX_CIRCLES_PER_TILE];
     __shared__ float3 sharedCirclesColor[MAX_CIRCLES_PER_TILE];
 
-    // temporarily keep this code to avoid memory errors for debugging but switch to dynamic allocation later
     int numCircles = tileMapping->tileCircleCounts[tileIdx];
-    
-    // if (numCircles > MAX_CIRCLES_PER_TILE) {
-    //     printf("Warning: Tile %d has %d circles, exceeding MAX_CIRCLES_PER_TILE (%d). Clamping.\n",
-    //            tileIdx, numCircles, MAX_CIRCLES_PER_TILE);
-    // }
     numCircles = min(numCircles, MAX_CIRCLES_PER_TILE);
    
 
@@ -803,22 +753,10 @@ __global__ void kernelRenderTiles(TileCircleMapping* tileMapping) {
         // Compute circle's contribution to this pixel
         float3 rgb;
         float alpha;
-        if (cuConstRendererParams.sceneName == SNOWFLAKES || 
-            cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
-            const float kCircleMaxAlpha = .5f;
-            const float falloffScale = 4.f;
 
-            float normPixelDist = sqrt(pixelDist) / rad;
-            rgb = lookupColor(normPixelDist);
-
-            float maxAlpha = .6f + .4f * (1.f - pos.z);
-            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
-            alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
-        } else {
-            // Simple: each circle has an assigned color
-            rgb = sharedCirclesColor[i];
-            alpha = 0.5f;
-        }
+        // Simple: each circle has an assigned color
+        rgb = sharedCirclesColor[i];
+        alpha = 0.5f;
 
         // Blend this circle's contribution with accumulated color
         float oneMinusAlpha = 1.f - alpha;
@@ -832,6 +770,296 @@ __global__ void kernelRenderTiles(TileCircleMapping* tileMapping) {
         pixelColor.w = alpha + oneMinusAlpha * pixelColor.w;
     }
     // Write final pixel color to global memory
+    *(float4*)(&cuConstRendererParams.imageData[offset]) = pixelColor;
+}
+
+// Strategy 1: Multi-pass rendering for tiles with many circles
+__global__ void kernelRenderTilesMultiPass(TileCircleMapping* tileMapping, int passOffset) {
+    int tileIdx = blockIdx.x;
+    int threadIdxId = threadIdx.y * blockDim.x + threadIdx.x;
+
+    if (tileIdx >= tileMapping->numTiles) 
+        return;
+
+    // Load circles affecting this tile into shared memory
+    __shared__ float3 sharedCirclesPos[MAX_CIRCLES_PER_TILE];
+    __shared__ float sharedCirclesRadius[MAX_CIRCLES_PER_TILE];
+    __shared__ float3 sharedCirclesColor[MAX_CIRCLES_PER_TILE];
+
+    int totalCircles = tileMapping->tileCircleCounts[tileIdx];
+    int startCircle = passOffset;
+    int endCircle = min(startCircle + MAX_CIRCLES_PER_TILE, totalCircles);
+    int numCircles = endCircle - startCircle;
+
+    if (numCircles <= 0) return;
+
+    // Cooperatively load circle data into shared memory
+    for (int i = threadIdxId; i < numCircles; i += blockDim.x * blockDim.y) {
+        int circleIdx = tileMapping->circleIndices[tileMapping->tileOffsets[tileIdx] + startCircle + i];
+
+        int index3 = 3 * circleIdx;
+        sharedCirclesPos[i] = *(float3*)(&cuConstRendererParams.position[index3]);
+        sharedCirclesRadius[i] = cuConstRendererParams.radius[circleIdx];
+        int colorIndex3 = 3 * circleIdx;
+        sharedCirclesColor[i] = *(float3*)(&cuConstRendererParams.color[colorIndex3]);
+    }
+    __syncthreads();
+
+    // Calculate pixel coordinates
+    int tileX = tileIdx % tileMapping->tilesPerRow;
+    int tileY = tileIdx / tileMapping->tilesPerRow;
+    int pixelX = tileX * TILE_SIZE + threadIdx.x;
+    int pixelY = tileY * TILE_SIZE + threadIdx.y;
+
+    if (pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight)
+        return;
+
+    float invWidth = 1.0f / cuConstRendererParams.imageWidth;
+    float invHeight = 1.0f / cuConstRendererParams.imageHeight;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+    int offset = 4 * (pixelY * cuConstRendererParams.imageWidth + pixelX);
+    float4 pixelColor = *(float4*)(&cuConstRendererParams.imageData[offset]);
+
+    // Process circles in this pass
+    for (int i = 0; i < numCircles; i++) {
+        float3 pos = sharedCirclesPos[i];
+        float rad = sharedCirclesRadius[i];
+
+        float diffX = pos.x - pixelCenterNorm.x;
+        float diffY = pos.y - pixelCenterNorm.y;
+        float pixelDist = diffX * diffX + diffY * diffY;
+        float maxDist = rad * rad;
+
+        if (pixelDist > maxDist) continue;
+
+        float3 rgb;
+        float alpha;
+        if (cuConstRendererParams.sceneName == SNOWFLAKES || 
+            cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+            const float kCircleMaxAlpha = .5f;
+            const float falloffScale = 4.f;
+
+            float normPixelDist = sqrt(pixelDist) / rad;
+            rgb = lookupColor(normPixelDist);
+
+            float maxAlpha = .6f + .4f * (1.f - pos.z);
+            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+            alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+        } else {
+            rgb = sharedCirclesColor[i];
+            alpha = 0.5f;
+        }
+
+        float oneMinusAlpha = 1.f - alpha;
+        pixelColor.x = alpha * rgb.x + oneMinusAlpha * pixelColor.x;
+        pixelColor.y = alpha * rgb.y + oneMinusAlpha * pixelColor.y;
+        pixelColor.z = alpha * rgb.z + oneMinusAlpha * pixelColor.z;
+        pixelColor.w = alpha + oneMinusAlpha * pixelColor.w;
+    }
+
+    *(float4*)(&cuConstRendererParams.imageData[offset]) = pixelColor;
+}
+
+// Strategy 2: Global memory approach for tiles with many circles
+__global__ void kernelRenderTilesGlobalMemory(TileCircleMapping* tileMapping) {
+    int tileIdx = blockIdx.x;
+    // int threadIdxId = threadIdx.y * blockDim.x + threadIdx.x;
+
+    if (tileIdx >= tileMapping->numTiles) 
+        return;
+
+    int numCircles = tileMapping->tileCircleCounts[tileIdx];
+    if (numCircles == 0) return;
+
+    // Calculate pixel coordinates
+    int tileX = tileIdx % tileMapping->tilesPerRow;
+    int tileY = tileIdx / tileMapping->tilesPerRow;
+    int pixelX = tileX * TILE_SIZE + threadIdx.x;
+    int pixelY = tileY * TILE_SIZE + threadIdx.y;
+
+    if (pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight)
+        return;
+
+    float invWidth = 1.0f / cuConstRendererParams.imageWidth;
+    float invHeight = 1.0f / cuConstRendererParams.imageHeight;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+    int offset = 4 * (pixelY * cuConstRendererParams.imageWidth + pixelX);
+    float4 pixelColor = *(float4*)(&cuConstRendererParams.imageData[offset]);
+
+    // Process all circles directly from global memory
+    for (int i = 0; i < numCircles; i++) {
+        int circleIdx = tileMapping->circleIndices[tileMapping->tileOffsets[tileIdx] + i];
+
+        // Load circle data from global memory
+        int index3 = 3 * circleIdx;
+        float3 pos = *(float3*)(&cuConstRendererParams.position[index3]);
+        float rad = cuConstRendererParams.radius[circleIdx];
+
+        float diffX = pos.x - pixelCenterNorm.x;
+        float diffY = pos.y - pixelCenterNorm.y;
+        float pixelDist = diffX * diffX + diffY * diffY;
+        float maxDist = rad * rad;
+
+        if (pixelDist > maxDist) continue;
+
+        float3 rgb;
+        float alpha;
+        if (cuConstRendererParams.sceneName == SNOWFLAKES || 
+            cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+            const float kCircleMaxAlpha = .5f;
+            const float falloffScale = 4.f;
+
+            float normPixelDist = sqrt(pixelDist) / rad;
+            rgb = lookupColor(normPixelDist);
+
+            float maxAlpha = .6f + .4f * (1.f - pos.z);
+            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+            alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+        } else {
+            int colorIndex3 = 3 * circleIdx;
+            rgb = *(float3*)(&cuConstRendererParams.color[colorIndex3]);
+            alpha = 0.5f;
+        }
+
+        float oneMinusAlpha = 1.f - alpha;
+        pixelColor.x = alpha * rgb.x + oneMinusAlpha * pixelColor.x;
+        pixelColor.y = alpha * rgb.y + oneMinusAlpha * pixelColor.y;
+        pixelColor.z = alpha * rgb.z + oneMinusAlpha * pixelColor.z;
+        pixelColor.w = alpha + oneMinusAlpha * pixelColor.w;
+    }
+
+    *(float4*)(&cuConstRendererParams.imageData[offset]) = pixelColor;
+}
+
+// Strategy 3: Hybrid approach - use shared memory when possible, global memory otherwise
+__global__ void kernelRenderTilesHybrid(TileCircleMapping* tileMapping) {
+    int tileIdx = blockIdx.x;
+    int threadIdxId = threadIdx.y * blockDim.x + threadIdx.x;
+
+    if (tileIdx >= tileMapping->numTiles) 
+        return;
+
+    int numCircles = tileMapping->tileCircleCounts[tileIdx];
+    if (numCircles == 0) return;
+
+    // Calculate pixel coordinates
+    int tileX = tileIdx % tileMapping->tilesPerRow;
+    int tileY = tileIdx / tileMapping->tilesPerRow;
+    int pixelX = tileX * TILE_SIZE + threadIdx.x;
+    int pixelY = tileY * TILE_SIZE + threadIdx.y;
+
+    if (pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight)
+        return;
+
+    float invWidth = 1.0f / cuConstRendererParams.imageWidth;
+    float invHeight = 1.0f / cuConstRendererParams.imageHeight;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+    int offset = 4 * (pixelY * cuConstRendererParams.imageWidth + pixelX);
+    float4 pixelColor = *(float4*)(&cuConstRendererParams.imageData[offset]);
+
+    if (numCircles <= MAX_CIRCLES_PER_TILE) {
+        // Use shared memory for small number of circles
+        __shared__ float3 sharedCirclesPos[MAX_CIRCLES_PER_TILE];
+        __shared__ float sharedCirclesRadius[MAX_CIRCLES_PER_TILE];
+        __shared__ float3 sharedCirclesColor[MAX_CIRCLES_PER_TILE];
+
+        // Cooperatively load circle data
+        for (int i = threadIdxId; i < numCircles; i += blockDim.x * blockDim.y) {
+            int circleIdx = tileMapping->circleIndices[tileMapping->tileOffsets[tileIdx] + i];
+
+            int index3 = 3 * circleIdx;
+            sharedCirclesPos[i] = *(float3*)(&cuConstRendererParams.position[index3]);
+            sharedCirclesRadius[i] = cuConstRendererParams.radius[circleIdx];
+            int colorIndex3 = 3 * circleIdx;
+            sharedCirclesColor[i] = *(float3*)(&cuConstRendererParams.color[colorIndex3]);
+        }
+        __syncthreads();
+
+        // Process from shared memory
+        for (int i = 0; i < numCircles; i++) {
+            float3 pos = sharedCirclesPos[i];
+            float rad = sharedCirclesRadius[i];
+
+            float diffX = pos.x - pixelCenterNorm.x;
+            float diffY = pos.y - pixelCenterNorm.y;
+            float pixelDist = diffX * diffX + diffY * diffY;
+            float maxDist = rad * rad;
+
+            if (pixelDist > maxDist) continue;
+
+            float3 rgb;
+            float alpha;
+            if (cuConstRendererParams.sceneName == SNOWFLAKES || 
+                cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+                const float kCircleMaxAlpha = .5f;
+                const float falloffScale = 4.f;
+
+                float normPixelDist = sqrt(pixelDist) / rad;
+                rgb = lookupColor(normPixelDist);
+
+                float maxAlpha = .6f + .4f * (1.f - pos.z);
+                maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+                alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+            } else {
+                rgb = sharedCirclesColor[i];
+                alpha = 0.5f;
+            }
+
+            float oneMinusAlpha = 1.f - alpha;
+            pixelColor.x = alpha * rgb.x + oneMinusAlpha * pixelColor.x;
+            pixelColor.y = alpha * rgb.y + oneMinusAlpha * pixelColor.y;
+            pixelColor.z = alpha * rgb.z + oneMinusAlpha * pixelColor.z;
+            pixelColor.w = alpha + oneMinusAlpha * pixelColor.w;
+        }
+    } else {
+        // Use global memory for large number of circles
+        for (int i = 0; i < numCircles; i++) {
+            int circleIdx = tileMapping->circleIndices[tileMapping->tileOffsets[tileIdx] + i];
+
+            int index3 = 3 * circleIdx;
+            float3 pos = *(float3*)(&cuConstRendererParams.position[index3]);
+            float rad = cuConstRendererParams.radius[circleIdx];
+
+            float diffX = pos.x - pixelCenterNorm.x;
+            float diffY = pos.y - pixelCenterNorm.y;
+            float pixelDist = diffX * diffX + diffY * diffY;
+            float maxDist = rad * rad;
+
+            if (pixelDist > maxDist) continue;
+
+            float3 rgb;
+            float alpha;
+            if (cuConstRendererParams.sceneName == SNOWFLAKES || 
+                cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+                const float kCircleMaxAlpha = .5f;
+                const float falloffScale = 4.f;
+
+                float normPixelDist = sqrt(pixelDist) / rad;
+                rgb = lookupColor(normPixelDist);
+
+                float maxAlpha = .6f + .4f * (1.f - pos.z);
+                maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+                alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+            } else {
+                int colorIndex3 = 3 * circleIdx;
+                rgb = *(float3*)(&cuConstRendererParams.color[colorIndex3]);
+                alpha = 0.5f;
+            }
+
+            float oneMinusAlpha = 1.f - alpha;
+            pixelColor.x = alpha * rgb.x + oneMinusAlpha * pixelColor.x;
+            pixelColor.y = alpha * rgb.y + oneMinusAlpha * pixelColor.y;
+            pixelColor.z = alpha * rgb.z + oneMinusAlpha * pixelColor.z;
+            pixelColor.w = alpha + oneMinusAlpha * pixelColor.w;
+        }
+    }
+
     *(float4*)(&cuConstRendererParams.imageData[offset]) = pixelColor;
 }
 
@@ -1001,9 +1229,12 @@ CudaRenderer::setup() {
     cudaCheckError(cudaMalloc(&hostTileMapping.tileCircleCounts, sizeof(int) * numTiles));
     cudaCheckError(cudaMalloc(&hostTileMapping.tileOffsets, sizeof(int) * numTiles));
 
-    // Worst case: every circle affects every tile
-    // cudaCheckError(cudaMalloc(&hostTileMapping.circleIndices, sizeof(int) * numCircles * numTiles));
-    hostTileMapping.circleIndices = nullptr; 
+    // Minor optimization for pattern scene. Since number of circles is relatively small, we can safely
+    // allocate a fixed-size array for circle indices. This avoids dynamic memory allocation during rendering.
+    hostTileMapping.circleIndices = nullptr;
+    if (sceneName == PATTERN) {
+         cudaCheckError(cudaMalloc(&hostTileMapping.circleIndices, sizeof(int) * numCircles * numTiles));
+    }
 
     // Copy tile mapping to device
     cudaCheckError(cudaMalloc(&deviceTileMapping, sizeof(TileCircleMapping)));
@@ -1067,6 +1298,7 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+// Starter code for the render function.
 // void
 // CudaRenderer::render() {
 
@@ -1078,21 +1310,20 @@ CudaRenderer::advanceAnimation() {
 //     cudaDeviceSynchronize();
 // }
 
-// Modified render function to use pixel-based parallelization
-// void CudaRenderer::render() {
-    
-//     // Use 2D thread blocks for pixel-based parallelization
-//     dim3 blockDim(32, 32);  // 256 threads per block
-//     dim3 gridDim(
-//         (image->width + blockDim.x - 1) / blockDim.x,
-//         (image->height + blockDim.y - 1) / blockDim.y);
-    
-//     kernelRenderCircles<<<gridDim, blockDim>>>();
-//     cudaDeviceSynchronize();
-// }
-
-// Modified render function to use tile-based parallelization
+// Modified render function with multi-pass support
 void CudaRenderer::render() {
+    if (sceneName == CIRCLE_RGB) {
+        // Special case for CIRCLE_RGB scene: render directly without tiling
+        // Use 2D thread blocks for pixel-based parallelization
+        dim3 blockDim(32, 32);  // 1024 threads per block
+        dim3 gridDim(
+            (image->width + blockDim.x - 1) / blockDim.x,
+            (image->height + blockDim.y - 1) / blockDim.y);
+        
+        kernelRenderCircles<<<gridDim, blockDim>>>();
+        cudaDeviceSynchronize();
+        return;
+    }
     // Phase 1: Clear counters and count circles per tile
     cudaCheckError(cudaMemset(hostTileMapping.tileCircleCounts, 0, sizeof(int) * hostTileMapping.numTiles));
 
@@ -1107,21 +1338,36 @@ void CudaRenderer::render() {
     thrust::device_ptr<int> dev_offsets(hostTileMapping.tileOffsets);
     thrust::exclusive_scan(dev_counts, dev_counts + hostTileMapping.numTiles, dev_offsets);
 
-    // Allocate circle indices array dynamically based on total counts
-    // Alternative: Use thrust::reduce to get total directly
-    // int totalCircleTilePairs = thrust::reduce(dev_counts, dev_counts + hostTileMapping.numTiles, 0, thrust::plus<int>());
+    // Special handling for PATTERN scene. We have already allocated a fixed size array for circle indices
+    // and know we don't need multiple passes.
+    if (sceneName == PATTERN) {
+        kernelBuildOrderedTileMappingWithPrefixSum<<<hostTileMapping.numTiles, threadsPerBlock>>>(deviceTileMapping);
+        cudaCheckError(cudaDeviceSynchronize());
 
+        // Phase 4: Choose rendering strategy
+        dim3 tileBlockDim(TILE_SIZE, TILE_SIZE);
+        int numTileBlocks = hostTileMapping.numTiles;
+
+        // kernelRenderTilesMultiPass<<<numTileBlocks, tileBlockDim>>>(deviceTileMapping, 0);
+        kernelRenderTiles<<<numTileBlocks, tileBlockDim>>>(deviceTileMapping);
+        cudaDeviceSynchronize();
+        return;
+    }
+   
+    // Calculate total number of circle-tile pairs
+    // This is the sum of all tileCircleCounts, which gives us the total number of
+    // circles that intersect with tiles, which is needed to allocate the circleIndices array.
     int totalCircleTilePairs = 0;
     cudaCheckError(cudaMemcpy(&totalCircleTilePairs, 
-                              &hostTileMapping.tileOffsets[hostTileMapping.numTiles - 1], 
-                              sizeof(int), 
-                              cudaMemcpyDeviceToHost));
+                            &hostTileMapping.tileOffsets[hostTileMapping.numTiles - 1], 
+                            sizeof(int), 
+                            cudaMemcpyDeviceToHost));
     
     int lastTileCount = 0;
     cudaCheckError(cudaMemcpy(&lastTileCount, 
-                              &hostTileMapping.tileCircleCounts[hostTileMapping.numTiles - 1], 
-                              sizeof(int), 
-                              cudaMemcpyDeviceToHost));
+                            &hostTileMapping.tileCircleCounts[hostTileMapping.numTiles - 1], 
+                            sizeof(int), 
+                            cudaMemcpyDeviceToHost));
     
     totalCircleTilePairs += lastTileCount;
 
@@ -1131,18 +1377,43 @@ void CudaRenderer::render() {
     }
     
     cudaCheckError(cudaMalloc(&hostTileMapping.circleIndices, sizeof(int) * totalCircleTilePairs));
-    
+
     // Update device copy of tile mapping
     cudaCheckError(cudaMemcpy(&deviceTileMapping->circleIndices, &hostTileMapping.circleIndices, sizeof(int*), cudaMemcpyHostToDevice));
+        
 
     // Phase 3: Use prefix sum approach to build the tile mapping
     kernelBuildOrderedTileMappingWithPrefixSum<<<hostTileMapping.numTiles, threadsPerBlock>>>(deviceTileMapping);
     cudaCheckError(cudaDeviceSynchronize());
 
-    // Phase 4: Render tiles
+    // Phase 4: Choose rendering strategy
     dim3 tileBlockDim(TILE_SIZE, TILE_SIZE);
     int numTileBlocks = hostTileMapping.numTiles;
 
-    kernelRenderTiles<<<numTileBlocks, tileBlockDim>>>(deviceTileMapping);
-    cudaCheckError(cudaDeviceSynchronize());
+    // Option 1: Multi-pass approach (more performant for many circles per tile)
+    #ifdef USE_MULTIPASS
+    // Find maximum circles per tile to determine number of passes needed
+    thrust::device_ptr<int> dev_counts_ptr(hostTileMapping.tileCircleCounts);
+    int maxCirclesPerTile = *thrust::max_element(dev_counts_ptr, dev_counts_ptr + hostTileMapping.numTiles);
+    
+    int numPasses = (maxCirclesPerTile + MAX_CIRCLES_PER_TILE - 1) / MAX_CIRCLES_PER_TILE;
+    
+    for (int pass = 0; pass < numPasses; pass++) {
+        int passOffset = pass * MAX_CIRCLES_PER_TILE;
+        kernelRenderTilesMultiPass<<<numTileBlocks, tileBlockDim>>>(deviceTileMapping, passOffset);
+        cudaDeviceSynchronize();
+    }
+    #endif
+
+    // Option 2: Hybrid approach
+    #ifdef USE_HYBRID
+    kernelRenderTilesHybrid<<<numTileBlocks, tileBlockDim>>>(deviceTileMapping);
+    cudaDeviceSynchronize();
+    #endif
+
+    // Option 3: Global memory approach
+    #ifdef USE_GLOBAL_MEMORY
+    kernelRenderTilesGlobalMemory<<<numTileBlocks, tileBlockDim>>>(deviceTileMapping);
+    cudaDeviceSynchronize();
+    #endif
 }
